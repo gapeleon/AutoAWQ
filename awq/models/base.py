@@ -507,6 +507,17 @@ class BaseAWQForCausalLM(nn.Module):
                 "Please install intel_extension_for_pytorch with "
                 "`pip install intel_extension_for_pytorch` for 'ipex' kernel!"
             )
+
+        # --- デバッグコード追加 ---
+        print("\n--- [Base] Before self._load_quantized_modules ---")
+        meta_params_before = [name for name, param in model.named_parameters() if param.is_meta]
+        print(f"Number of meta parameters before replacement: {len(meta_params_before)}")
+        if len(meta_params_before) < 20: # 多すぎるとログが長くなるため制限
+            for name in meta_params_before:
+                print(f"  - Meta param (before): {name}")
+        if torch.cuda.is_available():
+            print(f"VRAM usage before replacement: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        # --- デバッグコード追加終了 ---
         # Prepare WQLinear layers, replace nn.Linear
         self._load_quantized_modules(
             self,
@@ -518,21 +529,81 @@ class BaseAWQForCausalLM(nn.Module):
             use_ipex=use_ipex,
         )
 
+        # --- デバッグコード追加 ---
+        print("\n--- [Base] After self._load_quantized_modules ---")
+        meta_params_after = []
+        non_meta_params_info = []
+        for name, param in model.named_parameters():
+            if param.is_meta:
+                meta_params_after.append(name)
+            else:
+                 # 量子化レイヤーのパラメータは特殊かもしれないので注意
+                try:
+                    device_info = param.device
+                except Exception:
+                    device_info = "Special (e.g., Packed Tensor)"
+                non_meta_params_info.append(f"{name} ({device_info})")
+
+
+        if meta_params_after:
+            print(f"WARNING: Found {len(meta_params_after)} parameters still on meta device after replacements:")
+            for name in meta_params_after:
+                print(f"  - Meta param (after): {name}")
+        else:
+            print("All parameters seem to be offloaded from meta device after replacements.")
+
+        # print("\nNon-meta parameters info (first 20):")
+        # for info in non_meta_params_info[:20]:
+        #      print(f"  - {info}")
+
+        if torch.cuda.is_available():
+            vram_after_replace = torch.cuda.memory_allocated()
+            print(f"VRAM usage after replacement: {vram_after_replace / 1024**2:.2f} MB")
+        # --- デバッグコード追加終了 ---
+
         model.tie_weights()
+
+        print("--- [Base] Before load_checkpoint_and_dispatch ---") # DEBUG
+        if torch.cuda.is_available():
+             print(f"VRAM usage before load_checkpoint_and_dispatch: {torch.cuda.memory_allocated() / 1024**2:.2f} MB") # DEBUG
 
         # loads the weights into modules and distributes
         # across available devices automatically
-        load_checkpoint_and_dispatch(
-            model,
-            checkpoint=model_weights_path,
-            device_map=device_map,
-            max_memory=max_memory,
-            no_split_module_classes=[self.layer_type],
-            offload_folder=offload_folder,
-            dtype=torch_dtype,
-        )
-        
+        try:
+            load_checkpoint_and_dispatch(
+                model,
+                checkpoint=model_weights_path,
+                device_map=device_map,
+                max_memory=max_memory,
+                # no_split_module_classes=[self.layer_type], # llama4 では self.layer_type = "Llama4TextDecoderLayer"
+                no_split_module_classes=[model.config.architectures[0]], # configから取得する方が確実かも
+                offload_folder=offload_folder,
+                dtype=torch_dtype,
+            )
+            print("--- [Base] After load_checkpoint_and_dispatch (Success) ---") # DEBUG
+            if torch.cuda.is_available():
+                print(f"VRAM usage after load_checkpoint_and_dispatch: {torch.cuda.memory_allocated() / 1024**2:.2f} MB") # DEBUG
 
+        except Exception as e:
+            print(f"\n--- ERROR during load_checkpoint_and_dispatch ---") # DEBUG
+            import traceback
+            traceback.print_exc()
+            print(f"\nModel structure just before error:") # DEBUG
+            # print(model) # モデル構造が大きい場合はコメントアウト
+            print("\nParameters just before error (checking meta status again):") # DEBUG
+            meta_params_onerror = []
+            for name, param in model.named_parameters():
+                if param.is_meta:
+                     meta_params_onerror.append(name)
+            if meta_params_onerror:
+                 print("Meta parameters found right before error:")
+                 for name in meta_params_onerror:
+                      print(f"  - {name}")
+            else:
+                 print("No meta parameters found right before error.")
+
+            raise e # エラーを再発生させる
+        
         # Dispath to devices
         awq_ext, msg = try_import("awq_ext")
         if fuse_layers:
@@ -641,6 +712,8 @@ class BaseAWQForCausalLM(nn.Module):
         # Get blocks of model
         layers = self.get_model_layers(model)
 
+        print("\n--- [Base] Starting _load_quantized_modules (Linear Replacement Part) ---") # DEBUG
+
         for i in tqdm_lib.tqdm(range(len(layers)), desc="Replacing layers..."):
             layer = layers[i]
 
@@ -656,6 +729,18 @@ class BaseAWQForCausalLM(nn.Module):
             self._scale_activations(self, layer)
 
             # Replace nn.Linear with WQLinear
+            # Replace nn.Linear with WQLinear
+            print(f"\n  Processing Layer {i} for Linear replacement:") # DEBUG
+            current_layer_device = 'meta' # デフォルトはmeta
+            try:
+                 current_layer_device = next(layer.parameters()).device
+            except StopIteration:
+                 print(f"    Layer {i} has no parameters?") # DEBUG
+            except Exception as e:
+                 print(f"    Could not get device for layer {i}: {e}") # DEBUG
+
+            print(f"    Target device hint for Layer {i}: {current_layer_device}") # DEBUG
+            
             for name, module in named_linears.items():
                 if use_ipex:
                     q_linear_module = WQLinear_IPEX
@@ -672,16 +757,28 @@ class BaseAWQForCausalLM(nn.Module):
                 elif version == "gemv_fast":
                     q_linear_module = WQLinear_GEMVFast
 
-
+                print(f"    Replacing {name} with {q_linear_module.__name__}") # DEBUG
                 q_linear = q_linear_module.from_linear(
                     module, quant_config.w_bit, quant_config.q_group_size, True
                 )
-                q_linear.to(next(layer.parameters()).device)
+                # q_linear.to(next(layer.parameters()).device) # 元のコード - レイヤーのデバイスに合わせる
+                # ★★★ `init_empty_weights` の文脈では、明示的に `to()` を呼ぶべきではないかもしれない
+                # `load_checkpoint_and_dispatch` が処理するはず
+                # デバイス情報をログに残す
+                try:
+                     # 量子化後のモジュールは device プロパティを持たない場合がある
+                     qlinear_device_info = q_linear.device if hasattr(q_linear, 'device') else 'N/A or Packed'
+                     print(f"      Created {q_linear_module.__name__}. Device info: {qlinear_device_info}") # DEBUG
+                except Exception as e:
+                     print(f"      Could not get device info for new q_linear: {e}") # DEBUG
+
                 set_op_by_name(layer, name, q_linear)
+                print(f"      Set {name} in layer {i}.") # DEBUG
 
             if not use_ipex:
                 torch.cuda.empty_cache()
             gc.collect()
+        print("--- [Base] Finished _load_quantized_modules (Linear Replacement Part) ---") # DEBUG
 
     @staticmethod
     def _scale_activations(self, layer):

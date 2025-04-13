@@ -278,17 +278,49 @@ class Llama4AWQForConditionalGeneration(BaseAWQForCausalLM):
         assert not (
             version == "gemv" and (use_exllama or use_exllama_v2 or use_ipex)
         ), "Exllama kernels only support GEMM version."
-        
+
         # Get blocks of model
         layers = self.get_model_layers(model)
 
-        for layer in tqdm_lib.tqdm(layers, desc="Replacing MoE Block..."):
+        print("\n--- [Llama4] Starting _load_quantized_modules (MoE Replacement Part) ---") # DEBUG
+
+        for i, layer in enumerate(tqdm_lib.tqdm(layers, desc="Replacing MoE Block...")):
             if isinstance(layer.feed_forward, OldLlama4TextMoe):
+                original_device = 'unknown'
+                try:
+                     original_device = layer.feed_forward.router.weight.device
+                except Exception:
+                     pass
+                print(f"\n  Layer {i}: Found OldLlama4TextMoe. Original device hint: {original_device}") # DEBUG
+
+                # 新しい Llama4TextMoe インスタンスを作成
                 moe_block = Llama4TextMoe(model.config.text_config)
-                moe_block = moe_block.to_empty(device=layer.feed_forward.router.weight.device)
+                print(f"    Created new Llama4TextMoe instance. Initial device: {next(moe_block.parameters()).device}") # DEBUG
+
+                # ★★★ to_empty を呼び出す ★★★
+                # target_device = layer.feed_forward.router.weight.device # 元のコードに基づくデバイス
+                target_device = 'meta' # エラーメッセージに従い 'meta' を試す
+                print(f"    Calling moe_block.to_empty(device='{target_device}')") # DEBUG
+                try:
+                    moe_block = moe_block.to_empty(device=target_device)
+
+                    # to_empty 適用後のデバイスを確認
+                    print(f"    After to_empty: Router meta: {hasattr(moe_block.router, 'weight') and moe_block.router.weight.is_meta}") # DEBUG
+                    print(f"    After to_empty: Shared expert meta: {next(moe_block.shared_expert.parameters()).is_meta}") # DEBUG
+                    for idx, expert in enumerate(moe_block.experts):
+                        print(f"    After to_empty: Expert {idx} meta: {next(expert.parameters()).is_meta}") # DEBUG
+
+                except Exception as e:
+                    print(f"    ERROR during moe_block.to_empty or device check: {e}") # DEBUG
+
+                # モジュールを置き換え
                 layer.feed_forward = moe_block
+                print(f"    Replaced layer {i}'s feed_forward with new MoE block.") # DEBUG
+
             gc.collect()
-        model.tie_weights()
+
+        print("--- [Llama4] Finished MoE Replacement Part ---") # DEBUG
+        # ここで model.tie_weights() は呼ばない (base.pyで呼ばれる)
         super()._load_quantized_modules(
             self, model=model, quant_config=quant_config, version=version, use_exllama=use_exllama, use_exllama_v2=use_exllama_v2, use_ipex=use_ipex
         )
